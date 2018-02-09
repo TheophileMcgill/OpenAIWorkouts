@@ -4,10 +4,10 @@ from gym.wrappers import Monitor
 
 from keras.models import Sequential
 from keras.layers import Dense
-from keras.optimizers import Adam
 
 
 class DQN:
+
     def __init__(self, n_dim_states, n_actions):
         self.n_dim_states = n_dim_states
         self.n_actions = n_actions
@@ -16,8 +16,7 @@ class DQN:
     def _createModel(self):
         model = Sequential()
         model.add(Dense(50, activation='relu', input_dim=self.n_dim_states))
-        model.add(Dense(self.n_actions, activation='linear'))
-        adam = Adam(0.001)
+        model.add(Dense(self.n_actions, activation='linear', input_dim=self.n_dim_states))
         model.compile(loss='mse', optimizer='adam')
         return model
 
@@ -38,24 +37,24 @@ class DQN:
 
 
 class Agent:
-    def __init__(self, n_dim_states, n_actions, gamma=0.99, max_epsilon=1, min_epsilon=0.01,
-     eps_decay=0.001, batch_size=64, mem_capacity=30000):
+
+    def __init__(self, n_dim_states, n_actions, gamma=0.99, min_epsilon=0.01,
+     eps_decay=0.001, batch_size=64, mem_capacity=10000):
         self.n_dim_states = n_dim_states
         self.n_actions = n_actions
         self.gamma = gamma
         self.batch_size = batch_size
-
-        # Keep target network separated for stability
+        
         self.current_DQN = DQN(n_dim_states, n_actions)
         self.target_DQN = DQN(n_dim_states, n_actions)
-
+      
         # List of past samples (state, action, reward, next_state)
         self.memory = []
         self.mem_capacity = mem_capacity
 
         # Important : epsilon decay, otherwise method has high variance
         self.n_steps = 0                # Keep track of number of steps to decrease epsilon
-        self.epsilon = max_epsilon      # Start by exploring all the time
+        self.epsilon = 1                # Start by exploring all the time
         self.min_epsilon = min_epsilon  # End up exploiting most of the time
         self.eps_decay = eps_decay      # Speed of decay for epsilon
         
@@ -67,6 +66,9 @@ class Agent:
         else:
             return np.argmax(self.current_DQN.predict_one(state))
 
+    def greedy_policy(self, state):
+        return np.argmax(self.current_DQN.predict_one(state))
+
     def observe(self, sample):
         # Add sample to memory, and delete one sample if capacity exceeded
         self.memory.append(sample)
@@ -74,6 +76,7 @@ class Agent:
             self.memory.pop(0)
         # Decrease epsilon to favor exploitation over exploration over time
         self.n_steps += 1
+        # TODO : find more info about epsilon decay schemes
         self.epsilon = self.min_epsilon + (
             1 - self.min_epsilon) * math.exp(-self.eps_decay * self.n_steps)
 
@@ -82,32 +85,32 @@ class Agent:
         batch_size = min(self.batch_size, len(self.memory))
         batch = random.sample(self.memory, batch_size)
 
-        # Predict q_values in batches for efficiency
+        # Prepare batches of states to predict q-values
         none_state = np.zeros(self.n_dim_states) # Used in place of None for next_state 
         states = np.array([sample[0] for sample in batch])
         next_states = np.array([(none_state if sample[3] is None else sample[3]) for sample in batch])
+
+        # Predict q-values in batches for efficiency
         q_values = self.current_DQN.predict(states)
-        # Predict q_values_next using target network
+        # Predict q_values_next using current and target network
         q_values_next_target = self.target_DQN.predict(next_states)
         q_values_next_current = self.current_DQN.predict(next_states)
 
-        # Fill in our training batch
-        X = np.zeros((batch_size, self.n_dim_states))
-        y = np.zeros((batch_size, self.n_actions))
+        # Fill in our training batch for DQN
+        # Important : target is the q_value itself for all actions except the one actually taken
+        X = states
+        y = q_values
         for i in range(batch_size):
             state, action, reward, next_state = batch[i]
-            # Important : target is the q_value itself for all actions except the one actually taken 
-            target = q_values[i]
             if next_state is None:
-                target[action] = reward
+                target = reward 
             else:
                 # DQN with frozen target : greedy policy + evaluation by target network
-                #target[action] = reward + self.gamma * np.amax(q_values_next_target[i])
+                #target = reward + self.gamma * np.amax(q_values_next_target[i])
                 # Double DQN : greedy policy by current network + evaluation by target network
                 next_action = np.argmax(q_values_next_current[i])
-                target[action] = reward + self.gamma * q_values_next_target[i, next_action]
-            X[i] = state
-            y[i] = target
+                target = reward + self.gamma * q_values_next_target[i, next_action]
+            y[i, action] = target
 
         # Fit network with training batch
         self.current_DQN.fit(X, y)
@@ -122,12 +125,13 @@ class Environment:
         #self.env = Monitor(gym.make(environment), 'CartPole-v1-experiment')
         self.env = gym.make(environment)
         self.n_episodes = 0
+        self.n_successes_in_a_row = 0
 
-    def run_episode(self, agent):
+    def run_episode_training(self, agent):
         self.n_episodes += 1
+        state = self.env.reset()
         # Every episode, update target network to reflect current network
         agent.update_target_network()
-        state = self.env.reset()
         total_reward = 0 
         while True:            
             self.env.render()
@@ -138,6 +142,24 @@ class Environment:
                 next_state = None
             agent.observe((state, action, reward, next_state))
             agent.experience_replay()            
+            state = next_state
+            total_reward += reward
+            if done:
+                if total_reward == 500.0:
+                    self.n_successes_in_a_row += 1
+                else:
+                    self.n_successes_in_a_row = 0
+                break
+        print("Episode {} (training), total reward: {}".format(self.n_episodes, total_reward))
+
+    def run_episode(self, agent):
+        self.n_episodes += 1
+        state = self.env.reset()
+        total_reward = 0
+        while True:            
+            self.env.render()
+            action = agent.greedy_policy(state)
+            next_state, reward, done, info = self.env.step(action)   
             state = next_state
             total_reward += reward
             if done:
@@ -153,5 +175,8 @@ if __name__ == "__main__":
 
     agent = Agent(n_dim_states, n_actions)
 
-    while(True):
+    while(env.n_successes_in_a_row < 5):
+        env.run_episode_training(agent)
+
+    while True:
         env.run_episode(agent)
